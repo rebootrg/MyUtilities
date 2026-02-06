@@ -1,125 +1,91 @@
-package com.open.rest.utility;
-
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.Setter;
+import java.net.http.HttpClient;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
-public class PojoBatchProcessor {
-
-	public static void main(String[] args) {
-		PojoBatchProcessor processor  = new PojoBatchProcessor();
-		List<MyRequestPayload> input = new ArrayList<MyRequestPayload>();
-		
-		for(int i=0 ; i < 100 ; i++) {
-			input.add(MyRequestPayload.builder().id(i).build());
-		}
-		processor.processInBatches(input);
-	}
-	
-	
-    // Thread-safe JSON mapper
+public class ProductionBatchProcessor {
+    private static final Logger log = LoggerFactory.getLogger(ProductionBatchProcessor.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final int MAX_RETRIES = 3;
-    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(200);
     
-    private static final HttpClient CLIENT = HttpClient.newBuilder()
-            .executor(EXECUTOR)
-            .build();
+    private final ExecutorService executor;
+    private final HttpClient httpClient;
+    private final OracleDatabaseService dbService;
+    private final ApiClient apiClient;
 
-    // Example POJO
-    @Getter
-    @Setter
-    @Builder
-    @AllArgsConstructor
-    @NoArgsConstructor
-    public static class MyRequestPayload {
-        public int id;
-        public String status;
-        public long timestamp;
+    private static final int BATCH_SIZE = 1000;
 
-        public MyRequestPayload(int id) {
-            this.id = id;
-            this.status = "PENDING";
-            this.timestamp = System.currentTimeMillis();
-        }
+    public ProductionBatchProcessor(int threadCount) {
+        // Naming threads helps in profiling and stack traces
+        ThreadFactory threadFactory = r -> {
+            Thread t = new Thread(r);
+            t.setName("api-worker-" + t.getId());
+            return t;
+        };
+
+        this.executor = Executors.newFixedThreadPool(threadCount, threadFactory);
+        this.httpClient = HttpClient.newBuilder()
+                .executor(executor)
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        
+        this.dbService = new OracleDatabaseService();
+        this.apiClient = new ApiClient(httpClient, MAPPER);
     }
 
-    public void processInBatches(List<MyRequestPayload> allPayloads) {
-        int totalSize = allPayloads.size();
-        int batchSize = 1000;
+    public void runProcess(List<MyRequestPayload> allPayloads) {
+        log.info("Starting production processing for {} records", allPayloads.size());
+        dbService.initializeTempTable();
 
-        for (int i = 0; i < totalSize; i += batchSize) {
-            int end = Math.min(i + batchSize, totalSize);
-            List<MyRequestPayload> batch = allPayloads.subList(i, end);
-
-            System.out.printf("Processing Batch: %d to %d%n", i, end);
-            
-            // Map POJOs to Async Tasks
-            CompletableFuture<?>[] futures = batch.stream()
-                .map(payload -> CompletableFuture.runAsync(() -> executeWithRetry(payload), EXECUTOR))
-                .toArray(CompletableFuture[]::new);
-
-            // Wait for this batch of 1000 to finish
-            CompletableFuture.allOf(futures).join();
-        }
-        EXECUTOR.shutdown();
-    }
-
-    private void executeWithRetry(MyRequestPayload payload) {
-        int attempts = 0;
-        while (attempts <= MAX_RETRIES) {
-            try {
-                // 1. Convert POJO to JSON string
-                String jsonBody = MAPPER.writeValueAsString(payload);
-
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create("https://api.example.com/data"))
-                        .header("Content-Type", "application/json")
-                        .timeout(Duration.ofSeconds(30))
-                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                        .build();
-
-                HttpResponse<String> response = CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                    return; // Success
-                }
-
-                // Retry only on Server Errors (5xx)
-                if (response.statusCode() < 500) break; 
-
-            } catch (Exception e) {
-                System.err.println("Attempt " + (attempts + 1) + " failed for ID " + payload.id);
-            }
-
-            attempts++;
-            if (attempts <= MAX_RETRIES) {
-                backoff(attempts);
-            }
-        }
-    }
-
-    private void backoff(int attempt) {
         try {
-            // Exponential backoff: 1s, 2s, 4s...
-            Thread.sleep((long) Math.pow(2, attempt - 1) * 1000);
+            for (int i = 0; i < allPayloads.size(); i += BATCH_SIZE) {
+                int end = Math.min(i + BATCH_SIZE, allPayloads.size());
+                List<MyRequestPayload> batch = allPayloads.subList(i, end);
+
+                processBatch(batch);
+                
+                log.info("Completed batch {}/{}", (i / BATCH_SIZE) + 1, (allPayloads.size() / BATCH_SIZE));
+            }
+        } finally {
+            shutdown();
+        }
+    }
+
+    private void processBatch(List<MyRequestPayload> batch) {
+        // Parallel execution of API calls
+        List<CompletableFuture<MyResponsePojo>> futures = batch.stream()
+                .map(payload -> CompletableFuture.supplyAsync(() -> apiClient.executeWithRetry(payload), executor))
+                .collect(Collectors.toList());
+
+        // Wait for all in batch
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        // Collect successful responses
+        List<MyResponsePojo> results = futures.stream()
+                .map(f -> f.getNow(null))
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+
+        // Batch save to Database
+        if (!results.isEmpty()) {
+            dbService.upsertResponses(results);
+        }
+    }
+
+    private void shutdown() {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
         } catch (InterruptedException e) {
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        log.info("Engine shutdown complete.");
     }
 }
