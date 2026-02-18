@@ -5,11 +5,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 public class RecordProcessorService {
     private final HttpClient httpClient;
@@ -33,15 +29,14 @@ public class RecordProcessorService {
                 .uri(URI.create("https://httpbin.org/post"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(data))
-                .timeout(Duration.ofSeconds(10)) 
+                .timeout(Duration.ofSeconds(10))
                 .build();
 
         return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .handle((response, ex) -> {
-                    // Logic to decide if we should retry
                     if (ex != null || (response != null && isRetryable(response.statusCode()))) {
                         if (attempts > 0) return retry(id, data, attempts, delay);
-                        return CompletableFuture.completedFuture(new ProcessResult(id, false, "Failed: " + (ex != null ? ex.getMessage() : response.statusCode())));
+                        return CompletableFuture.completedFuture(new ProcessResult(id, false, "Error: " + (ex != null ? ex.getMessage() : response.statusCode())));
                     }
                     return CompletableFuture.completedFuture(new ProcessResult(id, true, response.body()));
                 })
